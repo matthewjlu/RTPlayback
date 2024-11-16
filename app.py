@@ -2,21 +2,18 @@ import sys
 import os
 import threading
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QPushButton, QTextEdit, QLabel, QVBoxLayout, QHBoxLayout
+    QApplication, QWidget, QPushButton, QTextEdit, QLabel, QVBoxLayout, QHBoxLayout, QSlider
 )
-from PyQt5.QtCore import Qt, QEvent, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from gtts import gTTS
 from tempfile import NamedTemporaryFile
 import vlc
-import random 
-import time
 
 class TTSApp(QWidget):
     speech_ready_signal = pyqtSignal(int, object)
 
     def __init__(self):
         super().__init__()
-        self.initUI()
 
         self.temp_file = None
 
@@ -24,27 +21,18 @@ class TTSApp(QWidget):
         self.vlc_instance = vlc.Instance()
         self.vlc_player = self.vlc_instance.media_player_new()
 
-        # Speed control parameters
+        # Playback speed parameters
         self.current_speed = 1.0
         self.target_speed = 1.0
         self.min_speed = 0.25   # Minimum speed VLC can handle
         self.max_speed = 2.0
 
-        # Smoothing parameters
-        self.speed_smoothing_factor = 0.05  # Adjust for smoother speed transitions
-        self.decay_rate = 0.01              # Adjust if needed
-
-        # Timers and flags
+        # Timer for gradual speed adjustment
         self.speed_update_timer = QTimer()
-        self.speed_update_timer.setInterval(2000)  # Increased interval for smoother updates
+        self.speed_update_timer.setInterval(400)  # Adjust interval for smoothness
         self.speed_update_timer.timeout.connect(self.update_playback_speed)
 
-        self.inactivity_timer = QTimer()
-        self.inactivity_timer.setSingleShot(True)
-        self.inactivity_timer.setInterval(10000)
-        self.inactivity_timer.timeout.connect(self.start_speed_decay)
-
-        self.decaying = False
+        self.initUI()
 
         # Text input handling
         self.text_change_timer = QTimer()
@@ -73,14 +61,16 @@ class TTSApp(QWidget):
         self.speak_button = QPushButton('Speak', self)
         self.speak_button.setEnabled(False)
         self.pause_button = QPushButton('Pause', self)
-        self.speed_label = QLabel('Playback Speed: 1.00x', self)
+        self.speed_label = QLabel(f'Playback Speed: {self.current_speed:.2f}x', self)
 
-        self.speed_control_widget = QLabel('Scroll here to adjust playback speed', self)
-        self.speed_control_widget.setAlignment(Qt.AlignCenter)
-        self.speed_control_widget.setStyleSheet('background-color: lightgray;')
-        self.speed_control_widget.setFixedHeight(50)
-
-        self.speed_control_widget.installEventFilter(self)
+        # Slider for playback speed control
+        self.speed_slider = QSlider(Qt.Horizontal, self)
+        self.speed_slider.setMinimum(int(self.min_speed * 100))
+        self.speed_slider.setMaximum(int(self.max_speed * 100))
+        self.speed_slider.setValue(int(self.current_speed * 100))
+        self.speed_slider.setTickInterval(25)
+        self.speed_slider.setTickPosition(QSlider.TicksBelow)
+        self.speed_slider.valueChanged.connect(self.on_speed_slider_changed)
 
         hbox = QHBoxLayout()
         hbox.addWidget(self.speak_button)
@@ -90,68 +80,47 @@ class TTSApp(QWidget):
         vbox.addWidget(self.text_edit)
         vbox.addLayout(hbox)
         vbox.addWidget(self.speed_label)
-        vbox.addWidget(self.speed_control_widget)
+        vbox.addWidget(self.speed_slider)
         self.setLayout(vbox)
 
         self.speak_button.clicked.connect(self.on_speak)
         self.pause_button.clicked.connect(self.on_pause)
 
-        self.setWindowTitle('TTS Scroll Speed Control')
+        self.setWindowTitle('TTS Playback Speed Control')
         self.setGeometry(100, 100, 400, 400)
         self.show()
 
-    def eventFilter(self, source, event):
-        if event.type() == QEvent.Wheel and source == self.speed_control_widget:
-            delta = event.angleDelta().y()
-            self.adjust_target_speed(delta)
-
+    def on_speed_slider_changed(self, value):
+        self.target_speed = value / 100.0
+        self.target_speed = max(self.min_speed, min(self.target_speed, self.max_speed))
+        self.speed_label.setText(f'Playback Speed: {self.target_speed:.2f}x')
+        if self.vlc_player.is_playing():
+            # Start or restart the speed update timer
             if not self.speed_update_timer.isActive():
                 self.speed_update_timer.start()
-
-            self.inactivity_timer.start()
-            self.decaying = False
-
-            return True
-        return super().eventFilter(source, event)
-
-    def adjust_target_speed(self, delta):
-        scaling_factor = 0.002
-        self.target_speed += delta * scaling_factor
-        self.target_speed = max(self.min_speed, min(self.target_speed, self.max_speed))
+        else:
+            # If not playing, set current speed directly
+            self.current_speed = self.target_speed
+            self.vlc_player.set_rate(self.current_speed)
 
     def update_playback_speed(self):
-        if self.decaying:
-            self.target_speed = max(self.min_speed, self.target_speed - self.decay_rate)
+        # Gradually adjust the current speed towards the target speed
+        speed_difference = self.target_speed - self.current_speed
+        speed_step = 0.01  # Adjust this value for smoothness and speed of transition
 
-        # Exponential smoothing for speed
-        self.current_speed = (self.speed_smoothing_factor * self.target_speed) + \
-                             ((1 - self.speed_smoothing_factor) * self.current_speed)
-        self.current_speed = max(self.min_speed, min(self.current_speed, self.max_speed))
+        if abs(speed_difference) < 0.01:
+            # Close enough to target speed
+            self.current_speed = self.target_speed
+            self.speed_update_timer.stop()
+        else:
+            # Increase or decrease current speed towards target speed
+            self.current_speed += speed_step if speed_difference > 0 else -speed_step
+            # Ensure current_speed stays within min and max limits
+            self.current_speed = max(self.min_speed, min(self.current_speed, self.max_speed))
 
         # Update VLC playback rate
-        if self.vlc_player.is_playing():
-            self.vlc_player.set_rate(random.uniform(0.25, 2))
-            #if abs(self.vlc_player.get_rate() - self.current_speed) > 0.01:
-                #self.vlc_player.set_rate(self.current_speed)
-
+        self.vlc_player.set_rate(self.current_speed)
         self.speed_label.setText(f'Playback Speed: {self.current_speed:.2f}x')
-
-        # Stop updates when target is reached
-        if abs(self.current_speed - self.target_speed) < 0.001:
-            self.current_speed = self.target_speed
-            if self.decaying and self.current_speed == self.min_speed:
-                self.decaying = False
-                self.speed_update_timer.stop()
-                # Optionally pause playback when minimum speed is reached
-                # self.vlc_player.pause()
-            elif not self.decaying:
-                self.speed_update_timer.stop()
-
-    def start_speed_decay(self):
-        if self.vlc_player.is_playing():
-            self.decaying = True
-            if not self.speed_update_timer.isActive():
-                self.speed_update_timer.start()
 
     def on_text_changed(self):
         self.text_change_timer.start()
@@ -209,6 +178,7 @@ class TTSApp(QWidget):
         # Set up VLC media player
         media = self.vlc_instance.media_new(self.temp_file.name)
         self.vlc_player.set_media(media)
+        self.vlc_player.set_rate(self.current_speed)
 
     def on_speak(self):
         if not self.speech_ready:
@@ -221,28 +191,20 @@ class TTSApp(QWidget):
 
         self.vlc_player.play()
         self.vlc_player.audio_set_volume(100)  # Set volume to maximum
-        self.inactivity_timer.start()
-        if not self.speed_update_timer.isActive():
-            self.speed_update_timer.start()
+        self.vlc_player.set_rate(self.current_speed)
 
     def on_pause(self):
         if self.vlc_player.is_playing():
             self.vlc_player.pause()
-            self.inactivity_timer.stop()
-            self.decaying = False
         else:
             self.vlc_player.play()
-            self.inactivity_timer.start()
-            if not self.speed_update_timer.isActive():
-                self.speed_update_timer.start()
+            self.vlc_player.set_rate(self.current_speed)
 
     def on_media_end(self, event):
         self.cleanup_temp_file()
         self.speech_ready = False
         self.vlc_player.stop()
-        self.speed_update_timer.stop()
-        self.inactivity_timer.stop()
-        self.decaying = False
+        self.speed_update_timer.stop()  # Stop the timer when playback ends
 
     def cleanup_temp_file(self):
         if self.temp_file:
