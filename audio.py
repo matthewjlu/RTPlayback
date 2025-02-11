@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import numpy as np
 from queue import Queue
@@ -11,7 +12,8 @@ import librosa
 # ------------------------------
 # Global Configuration & State
 # ------------------------------
-AUDIO_PATH = '/Users/mattlu/Desktop/test.wav'
+file_name = "test.wav"
+AUDIO_PATH = os.path.abspath(file_name)
 BATCH_DURATION = 1.0      # seconds per time-stretch batch (shorter batches reduce latency)
 PLAYBACK_CHUNK = 2048     # frames per write to PyAudio
 SAMPLE_RATE = 44100
