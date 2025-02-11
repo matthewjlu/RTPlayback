@@ -9,7 +9,7 @@ from threading import Event, Thread
 import time
 
 # ------------------------------
-# Configuration
+# Configuration!
 # ------------------------------
 AUDIO_PATH = '/Users/mattlu/Desktop/test.wav'
 BATCH_DURATION = 1.0   # seconds per time-stretch batch
