@@ -19,6 +19,8 @@ PLAYBACK_CHUNK = 2048     # frames per write to PyAudio
 SAMPLE_RATE = 44100
 BUFFER_SIZE = 8
 MIN_SPEED, MAX_SPEED = 0.1, 2.0
+#how many seconds in the past you want to take an average
+TIME = 5
 
 # Smoothing: lower values yield smoother, less abrupt speed changes.
 SMOOTHING_ALPHA = 0.1
@@ -185,7 +187,7 @@ class SpeedControlWindow(QtWidgets.QWidget):
         # Record the new speed along with the timestamp.
         self.scroll_events.append((now, current_speed))
         # Keep only events from the past 10 seconds.
-        self.scroll_events = [(t, s) for (t, s) in self.scroll_events if now - t <= 10]
+        self.scroll_events = [(t, s) for (t, s) in self.scroll_events if now - t <= TIME]
 
     def auto_update_speed(self):
         """
@@ -196,6 +198,7 @@ class SpeedControlWindow(QtWidgets.QWidget):
         """
         global current_speed
         now = time.time()
+        epsilon = 1e-6
 
         # Determine the time of the most recent scroll event (if any).
         if self.scroll_events:
@@ -209,9 +212,13 @@ class SpeedControlWindow(QtWidgets.QWidget):
 
         if self.scroll_events:
             # Compute average of speeds from the past 10 seconds.
-            recent_events = [(t, s) for (t, s) in self.scroll_events if now - t <= 10]
+            recent_events = [(t, s) for (t, s) in self.scroll_events if now - t <= TIME]
             if recent_events:
-                avg_speed = sum(s for (t, s) in recent_events) / len(recent_events)
+                print(recent_events)
+                #performing weighted sum
+                weighted_sum = sum(s * (1 / (now - t + epsilon)) for (t, s) in recent_events)
+                total_weight = sum(1 / (now - t + epsilon) for (t, s) in recent_events)
+                avg_speed = weighted_sum / total_weight if total_weight != 0 else self.smoothed_speed
             else:
                 avg_speed = self.smoothed_speed
             # Update using the computed average.
@@ -221,8 +228,11 @@ class SpeedControlWindow(QtWidgets.QWidget):
         else:
             # No scroll events have been recorded in the last 10 seconds.
             # Gradually recover the speed toward 1.0.
-            recovery_rate = 0.1  # Adjust recovery speed as needed.
-            new_speed = self.smoothed_speed + (1.0 - self.smoothed_speed) * recovery_rate
+            recovery_rate = 0.1  # Determines how fast you move toward 0.
+            new_speed = self.smoothed_speed + (0 - self.smoothed_speed) * recovery_rate
+            # This simplifies to:
+            new_speed = self.smoothed_speed * (1 - recovery_rate)
+
 
         self.target_speed = new_speed
         self.smoothed_speed = new_speed
