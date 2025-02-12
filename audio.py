@@ -139,7 +139,6 @@ def audio_playback_worker():
             hann_win = np.hanning(actual_fade * 2)
             fade_in = hann_win[:actual_fade]
             fade_out = hann_win[actual_fade:]
-            # Apply the fade-in to the beginning and fade-out to the end of the chunk
             chunk[:actual_fade] *= fade_in
             chunk[-actual_fade:] *= fade_out
 
@@ -162,10 +161,9 @@ class SpeedControlWindow(QtWidgets.QWidget):
     
     • Immediate changes: each wheel event updates the speed and sends it to the audio thread.
     • Scroll-session recording: records only the start and end of each scroll session.
-    • Auto-update: every 3 seconds, if no scroll occurs, computes a weighted average (using inverse‑time or Gaussian weighting)
-      or decays the speed toward 0. If the computed speed is below 0.07, playback is paused.
+    • Auto-update: every 2 seconds, if no scroll occurs, computes a weighted average using Gaussian weighting
+      and updates the speed immediately.
     • A Pause/Resume button allows manual control.
-    • Gradual speed updates (over a few steps) are used to smooth the transitions and avoid popping.
     """
     def __init__(self):
         super().__init__()
@@ -202,34 +200,6 @@ class SpeedControlWindow(QtWidgets.QWidget):
         self.auto_timer.timeout.connect(self.auto_update_speed)
         self.auto_timer.start()
 
-        # For gradual updates to avoid abrupt changes:
-        self.gradual_timer = QtCore.QTimer(self)
-        self.gradual_timer.setInterval(20)  # 20 ms per step
-        self.gradual_timer.timeout.connect(self.update_speed_step)
-        self.gradual_steps = 0
-        self.gradual_current_step = 0
-        self.gradual_increment = 0
-
-    def start_gradual_update(self, new_speed, steps=10):
-        """Start a gradual update from current smoothed_speed to new_speed in a given number of steps."""
-        self.gradual_steps = steps
-        self.gradual_current_step = 0
-        diff = new_speed - self.smoothed_speed
-        self.gradual_increment = diff / steps
-        self.gradual_timer.start()
-        print(f"Starting gradual update from {self.smoothed_speed:.2f} to {new_speed:.2f} over {steps} steps.")
-
-    def update_speed_step(self):
-        """Update one step in the gradual speed change."""
-        if self.gradual_current_step >= self.gradual_steps:
-            self.gradual_timer.stop()
-            return
-        self.smoothed_speed += self.gradual_increment
-        self.target_speed = self.smoothed_speed
-        speed_queue.put(self.smoothed_speed)
-        self.label.setText(f"Playback Speed: {self.smoothed_speed:.2f}x")
-        self.gradual_current_step += 1
-
     def toggle_pause(self):
         """Manually toggle the paused state."""
         global paused
@@ -260,6 +230,7 @@ class SpeedControlWindow(QtWidgets.QWidget):
 
         self.target_speed += delta * 0.1
         self.target_speed = max(MIN_SPEED, min(self.target_speed, MAX_SPEED))
+        # Exponential smoothing:
         self.smoothed_speed = (SMOOTHING_ALPHA * self.target_speed +
                                (1 - SMOOTHING_ALPHA) * self.smoothed_speed)
         current_speed = self.smoothed_speed
@@ -281,9 +252,8 @@ class SpeedControlWindow(QtWidgets.QWidget):
 
     def auto_update_speed(self):
         """
-        Every 3 seconds, if no scroll event occurred, update speed automatically.
-        If manually paused, auto-update is skipped.
-        Uses gradual update to avoid abrupt changes (and popping).
+        Every 2 seconds, if no scroll event occurred, update speed automatically.
+        Uses Gaussian weighting (or recovery decay if no events) and updates speed immediately.
         """
         global current_speed, paused
         now = time.time()
@@ -293,19 +263,21 @@ class SpeedControlWindow(QtWidgets.QWidget):
             print("Auto-update skipped because playback is manually paused.")
             return
 
+        # Determine the time of the most recent scroll event.
         if self.scroll_events:
             most_recent = max(t for t, s in self.scroll_events)
         else:
             most_recent = 0
 
-        if now - most_recent < 3:
+        if now - most_recent < 2:
             return
 
+        # If we have scroll events, compute the Gaussian weighted average.
         if self.scroll_events:
             recent_events = [(t, s) for (t, s) in self.scroll_events if now - t <= TIME]
             if recent_events:
                 if use_gaussian:
-                    avg_speed = gaussian_weighted_average(recent_events, now, mu=0, sigma=TIME/2.0, epsilon=epsilon)
+                    avg_speed = gaussian_weighted_average(recent_events, now, mu=0, sigma=20, epsilon=epsilon)
                 else:
                     weighted_sum = sum(s * (1 / (now - t + epsilon)) for (t, s) in recent_events)
                     total_weight = sum(1 / (now - t + epsilon) for (t, s) in recent_events)
@@ -315,7 +287,7 @@ class SpeedControlWindow(QtWidgets.QWidget):
             self.scroll_events.clear()
             new_speed = avg_speed
         else:
-            recovery_rate = 0.15
+            recovery_rate = 0.3
             new_speed = self.smoothed_speed * (1 - recovery_rate)
 
         if new_speed < 0.07:
@@ -330,13 +302,13 @@ class SpeedControlWindow(QtWidgets.QWidget):
         else:
             paused = False
 
-        if abs(new_speed - self.smoothed_speed) > 0.05:
-            self.start_gradual_update(new_speed, steps=10)
-        else:
-            self.target_speed = new_speed
-            self.smoothed_speed = new_speed
-            current_speed = new_speed
-            speed_queue.put(new_speed)
+        self.target_speed = new_speed
+        self.smoothed_speed = new_speed
+        current_speed = new_speed
+        speed_queue.put(new_speed)
+        print(f"Auto-updated speed to {new_speed:.2f}")
+        # Update the playback speed label text immediately.
+        self.label.setText(f"Playback Speed: {new_speed:.2f}x")
 
     def close_app(self):
         """Stop all processing and quit the application."""
