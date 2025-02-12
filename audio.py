@@ -2,7 +2,7 @@ import sys
 import os
 import time
 import numpy as np
-from queue import Queue
+from queue import Queue, Empty
 from threading import Event, Thread
 from PyQt5 import QtWidgets, QtCore
 import pyaudio
@@ -14,22 +14,39 @@ import librosa
 # ------------------------------
 file_name = "test.wav"
 AUDIO_PATH = os.path.abspath(file_name)
-BATCH_DURATION = 1.0      # seconds per time-stretch batch (shorter batches reduce latency)
+BATCH_DURATION = 1.0      # seconds per time-stretch batch
 PLAYBACK_CHUNK = 2048     # frames per write to PyAudio
 SAMPLE_RATE = 44100
 BUFFER_SIZE = 8
 MIN_SPEED, MAX_SPEED = 0.1, 2.0
-#how many seconds in the past you want to take an average
-TIME = 5
+TIME = 15  # seconds in the past used for averaging
 
-# Smoothing: lower values yield smoother, less abrupt speed changes.
-SMOOTHING_ALPHA = 0.1
+SMOOTHING_ALPHA = 0.1  # for exponential smoothing
 
 # Global flags and queues.
 stop_event = Event()         # Signals termination to threads.
 speed_queue = Queue()        # To send updated speed values to the audio thread.
 audio_queue = Queue(maxsize=BUFFER_SIZE)  # Audio data is passed via this queue.
 current_speed = 1.0          # Global state: current playback speed.
+paused = False               # Global flag for whether playback is paused.
+
+# Option: set to True to use Gaussian weighting instead of inverse-time weighting.
+use_gaussian = True
+
+# ------------------------------
+# Gaussian Weighting Function
+# ------------------------------
+def gaussian_weighted_average(recent_events, now, mu=0, sigma=TIME/2.0, epsilon=1e-6):
+    """
+    Computes the weighted average of speeds from recent_events using Gaussian weights.
+    
+    Each event is a tuple (t, s), where t is the timestamp and s is the speed.
+    The weight is computed as:
+         weight = exp(-((now - t - mu)**2) / (2 * sigma**2))
+    """
+    weighted_sum = sum(s * np.exp(-((now - t - mu)**2) / (2 * sigma**2)) for (t, s) in recent_events)
+    total_weight = sum(np.exp(-((now - t - mu)**2) / (2 * sigma**2)) for (t, s) in recent_events)
+    return weighted_sum / (total_weight + epsilon)
 
 # ------------------------------
 # Audio Processing Functions
@@ -38,6 +55,7 @@ def load_and_process_audio():
     """
     Loads the audio file, normalizes it, and processes it in batches.
     Each batch is time-stretched using the most recent speed value.
+    When the speed is near 0, outputs silence.
     """
     y, sr = librosa.load(AUDIO_PATH, sr=SAMPLE_RATE, mono=True)
     peak = np.max(np.abs(y))
@@ -50,7 +68,6 @@ def load_and_process_audio():
     local_speed = 1.0
 
     while position < total_samples and not stop_event.is_set():
-        # Update the local speed if new speed values have been queued.
         while not speed_queue.empty():
             local_speed = speed_queue.get()
             local_speed = max(MIN_SPEED, min(local_speed, MAX_SPEED))
@@ -59,8 +76,9 @@ def load_and_process_audio():
         raw_chunk = y[position:end]
         position = end
 
-        # Apply time-stretching if needed.
-        if local_speed != 1.0:
+        if local_speed < 0.07:
+            stretched = np.zeros_like(raw_chunk)
+        elif local_speed != 1.0:
             try:
                 stretched = pyrb.time_stretch(raw_chunk, sr, local_speed)
             except Exception as e:
@@ -69,7 +87,6 @@ def load_and_process_audio():
         else:
             stretched = raw_chunk
 
-        # Split the processed batch into smaller playback chunks.
         idx = 0
         while idx < len(stretched) and not stop_event.is_set():
             sub_end = min(idx + PLAYBACK_CHUNK, len(stretched))
@@ -77,14 +94,14 @@ def load_and_process_audio():
             idx = sub_end
             audio_queue.put(sub_chunk)
     
-    # Signal end-of-audio.
     audio_queue.put(None)
-
 
 def audio_playback_worker():
     """
     Continuously fetches audio chunks from the queue and writes them to the audio stream.
+    If playback is paused, the thread sleeps without writing audio.
     """
+    global paused
     p = pyaudio.PyAudio()
     stream = p.open(
         format=pyaudio.paFloat32,
@@ -95,7 +112,18 @@ def audio_playback_worker():
     )
 
     while not stop_event.is_set():
-        chunk = audio_queue.get()
+        if paused:
+            if stream.is_active():
+                stream.stop_stream()
+            time.sleep(0.1)
+            continue
+        else:
+            if not stream.is_active():
+                stream.start_stream()
+        try:
+            chunk = audio_queue.get(timeout=0.1)
+        except Empty:
+            continue
         if chunk is None:
             break
         data = chunk.astype(np.float32).tobytes()
@@ -108,7 +136,6 @@ def audio_playback_worker():
     stream.close()
     p.terminate()
 
-
 # ------------------------------
 # PyQt5 SpeedControlWindow
 # ------------------------------
@@ -116,148 +143,213 @@ class SpeedControlWindow(QtWidgets.QWidget):
     """
     A PyQt5 widget that adjusts playback speed via mouse wheel scrolling.
     
-    Immediate changes:
-      - Every scroll event immediately adjusts the speed (using an exponential moving average)
-        and records the resulting speed with a timestamp.
-    
-    Auto-update:
-      - A QTimer fires every 3 seconds.
-      - If no scroll event has occurred in the last 3 seconds, the callback:
-          * If recent scroll events (from the past 10 seconds) exist, computes their average and updates the speed.
-          * If no scroll events are recorded, gradually recovers the speed toward 1.0.
-      - This auto-update occurs repeatedly every 3 seconds if inactivity continues.
+    • Immediate changes: each wheel event updates the speed and sends it to the audio thread.
+    • Scroll-session recording: records only the start and end of each scroll session.
+    • Auto-update: every 3 seconds, if no scroll occurs, computes a weighted average (using inverse‑time or Gaussian weighting)
+      or decays the speed toward 0. If the computed speed is below 0.07, playback is paused.
+    • A Pause/Resume button allows manual control.
+    • Gradual speed updates (over a few steps) are used to smooth the transitions and avoid popping.
     """
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Real-time Audio Speed Control (Scroll to Adjust)")
-        self.resize(300, 100)
+        self.resize(300, 160)
 
-        # Variables to track target and smoothed speeds.
         self.target_speed = 1.0
         self.smoothed_speed = 1.0
 
-        # Label to display current playback speed.
         self.label = QtWidgets.QLabel("Playback Speed: 1.00x", self)
         self.label.setAlignment(QtCore.Qt.AlignCenter)
 
-        # Quit button.
+        self.pause_button = QtWidgets.QPushButton("Pause", self)
+        self.pause_button.clicked.connect(self.toggle_pause)
+
         self.quit_button = QtWidgets.QPushButton("Quit", self)
         self.quit_button.clicked.connect(self.close_app)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addWidget(self.label)
+        layout.addWidget(self.pause_button)
         layout.addWidget(self.quit_button)
         self.setLayout(layout)
 
-        # List to record (timestamp, speed) for each scroll event.
         self.scroll_events = []
+        self.scroll_session_active = False
 
-        # Timer for auto-update: fires every 3 seconds.
+        self.scroll_end_timer = QtCore.QTimer(self)
+        self.scroll_end_timer.setSingleShot(True)
+        self.scroll_end_timer.timeout.connect(self.finalize_scroll_session)
+
         self.auto_timer = QtCore.QTimer(self)
-        self.auto_timer.setInterval(3000)  # 3000 ms = 3 seconds
+        self.auto_timer.setInterval(3000)  # every 3 seconds
         self.auto_timer.timeout.connect(self.auto_update_speed)
         self.auto_timer.start()
 
-    def wheelEvent(self, event):
-        """
-        Handles mouse wheel events:
-          - Updates the target speed (each notch changes speed by 0.1).
-          - Uses an exponential moving average to smooth the speed.
-          - Immediately sends the new speed to the audio thread.
-          - Records the new (smoothed) speed with its timestamp.
-        """
-        global current_speed
+        # For gradual updates to avoid pops:
+        self.gradual_timer = QtCore.QTimer(self)
+        self.gradual_timer.setInterval(20)  # 20 ms per step
+        self.gradual_timer.timeout.connect(self.update_speed_step)
+        self.gradual_steps = 0
+        self.gradual_current_step = 0
+        self.gradual_increment = 0
 
-        # Normalize the delta (one notch is typically ±120, so divide by 120).
+    def start_gradual_update(self, new_speed, steps=10):
+        """Start a gradual update from current smoothed_speed to new_speed in a given number of steps."""
+        self.gradual_steps = steps
+        self.gradual_current_step = 0
+        diff = new_speed - self.smoothed_speed
+        self.gradual_increment = diff / steps
+        self.gradual_timer.start()
+        print(f"Starting gradual update from {self.smoothed_speed:.2f} to {new_speed:.2f} over {steps} steps.")
+
+    def update_speed_step(self):
+        """Update one step in the gradual speed change."""
+        if self.gradual_current_step >= self.gradual_steps:
+            self.gradual_timer.stop()
+            return
+        self.smoothed_speed += self.gradual_increment
+        self.target_speed = self.smoothed_speed
+        speed_queue.put(self.smoothed_speed)
+        self.label.setText(f"Playback Speed: {self.smoothed_speed:.2f}x")
+        self.gradual_current_step += 1
+
+    def toggle_pause(self):
+        """Manually toggle the paused state."""
+        global paused
+        paused = not paused
+        if paused:
+            self.pause_button.setText("Resume")
+            self.label.setText("Playback Paused")
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                except Empty:
+                    break
+            print("Manually paused playback.")
+        else:
+            self.pause_button.setText("Pause")
+            print("Resumed playback.")
+
+    def wheelEvent(self, event):
+        """On wheel event: update speed and record session events."""
+        global current_speed, paused
         delta = event.angleDelta().y() / 120.0
         now = time.time()
 
-        # Immediate adjustment: update target speed by 0.1 per notch.
+        if not self.scroll_session_active:
+            self.scroll_session_active = True
+            self.scroll_events.append((now, self.smoothed_speed))
+            print(f"Scroll session started, start speed: {self.smoothed_speed:.2f}")
+
         self.target_speed += delta * 0.1
         self.target_speed = max(MIN_SPEED, min(self.target_speed, MAX_SPEED))
-
-        # Apply exponential moving average for smoothing.
+        # Immediate update with exponential smoothing:
         self.smoothed_speed = (SMOOTHING_ALPHA * self.target_speed +
                                (1 - SMOOTHING_ALPHA) * self.smoothed_speed)
         current_speed = self.smoothed_speed
-        speed_queue.put(current_speed)
-        self.label.setText(f"Playback Speed: {current_speed:.2f}x")
-        print(f"Immediate speed changed to {current_speed:.2f}x via scroll event")
 
-        # Record the new speed along with the timestamp.
-        self.scroll_events.append((now, current_speed))
-        # Keep only events from the past 10 seconds.
-        self.scroll_events = [(t, s) for (t, s) in self.scroll_events if now - t <= TIME]
+        # If new input brings speed above zero, resume if paused.
+        if self.smoothed_speed > 0:
+            paused = False
+            self.pause_button.setText("Pause")
+        speed_queue.put(self.smoothed_speed)
+        self.label.setText(f"Playback Speed: {self.smoothed_speed:.2f}x")
+        print(f"Immediate speed changed to {self.smoothed_speed:.2f}x via scroll event")
+        self.scroll_end_timer.start(300)
+
+    def finalize_scroll_session(self):
+        """Record the end of a scroll session."""
+        now = time.time()
+        self.scroll_events.append((now, self.smoothed_speed))
+        print(f"Scroll session ended, end speed: {self.smoothed_speed:.2f}")
+        self.scroll_session_active = False
 
     def auto_update_speed(self):
         """
-        Called every 3 seconds.
-        If no scroll event has occurred in the last 3 seconds, then:
-          - If recent scroll events exist (within the past 10 seconds), compute their average and update the speed.
-          - Otherwise, gradually recover the speed toward 1.0.
+        Every 3 seconds, if no scroll event occurred, update speed automatically.
+        If manually paused, auto-update is skipped.
+        Uses gradual update to avoid abrupt changes (and popping).
         """
-        global current_speed
+        global current_speed, paused
         now = time.time()
         epsilon = 1e-6
 
-        # Determine the time of the most recent scroll event (if any).
+        if paused:
+            print("Auto-update skipped because playback is manually paused.")
+            return
+
         if self.scroll_events:
             most_recent = max(t for t, s in self.scroll_events)
         else:
             most_recent = 0
 
         if now - most_recent < 3:
-            # The user has scrolled within the last 3 seconds; do not auto-update.
             return
 
         if self.scroll_events:
-            # Compute average of speeds from the past 10 seconds.
             recent_events = [(t, s) for (t, s) in self.scroll_events if now - t <= TIME]
             if recent_events:
-                print(recent_events)
-                #performing weighted sum
-                weighted_sum = sum(s * (1 / (now - t + epsilon)) for (t, s) in recent_events)
-                total_weight = sum(1 / (now - t + epsilon) for (t, s) in recent_events)
-                avg_speed = weighted_sum / total_weight if total_weight != 0 else self.smoothed_speed
+                if use_gaussian:
+                    avg_speed = gaussian_weighted_average(recent_events, now, mu=0, sigma=TIME/2.0, epsilon=epsilon)
+                else:
+                    weighted_sum = sum(s * (1 / (now - t + epsilon)) for (t, s) in recent_events)
+                    total_weight = sum(1 / (now - t + epsilon) for (t, s) in recent_events)
+                    avg_speed = weighted_sum / (total_weight + epsilon)
             else:
                 avg_speed = self.smoothed_speed
-            # Update using the computed average.
-            new_speed = avg_speed
-            # Clear events to start fresh for the next period.
             self.scroll_events.clear()
+            new_speed = avg_speed
         else:
-            # No scroll events have been recorded in the last 10 seconds.
-            # Gradually recover the speed toward 1.0.
-            recovery_rate = 0.1  # Determines how fast you move toward 0.
-            new_speed = self.smoothed_speed + (0 - self.smoothed_speed) * recovery_rate
-            # This simplifies to:
+            recovery_rate = 0.3
             new_speed = self.smoothed_speed * (1 - recovery_rate)
 
+        if new_speed < 0.07:
+            new_speed = 0
+            self.label.setText("Playback Paused")
+            print("Auto-updated speed below threshold; pausing playback.")
+            while True:
+                try:
+                    audio_queue.get_nowait()
+                except Empty:
+                    break
+            paused = True
+        else:
+            self.label.setText(f"Playback Speed: {new_speed:.2f}x (Auto-updated)")
+            print(f"Auto-updated speed to {new_speed:.2f}x")
+            paused = False
 
-        self.target_speed = new_speed
-        self.smoothed_speed = new_speed
-        current_speed = new_speed
-        speed_queue.put(current_speed)
-        self.label.setText(f"Playback Speed: {current_speed:.2f}x (Auto-updated)")
-        print(f"Auto-updated speed to {current_speed:.2f}x")
+        # Instead of updating abruptly, start a gradual update if there is a significant change.
+        if abs(new_speed - self.smoothed_speed) > 0.05:
+            self.start_gradual_update(new_speed, steps=10)
+        else:
+            # If change is minimal, update directly.
+            self.target_speed = new_speed
+            self.smoothed_speed = new_speed
+            current_speed = new_speed
+            speed_queue.put(new_speed)
 
     def close_app(self):
-        """Stops audio processing and closes the application."""
+        """Stop all processing and quit the application."""
+        print("Quit button pressed. Shutting down...")
         stop_event.set()
+        while True:
+            try:
+                audio_queue.get_nowait()
+            except Empty:
+                break
+        audio_queue.put(None)
         self.close()
-
+        QtWidgets.QApplication.quit()
 
 # ------------------------------
 # Main Function
 # ------------------------------
 def main():
-    # Start the audio processing and playback threads.
     processing_thread = Thread(target=load_and_process_audio, daemon=True)
     playback_thread = Thread(target=audio_playback_worker, daemon=True)
     processing_thread.start()
     playback_thread.start()
 
-    # Set up and run the PyQt application.
     app = QtWidgets.QApplication(sys.argv)
     window = SpeedControlWindow()
     window.show()
@@ -266,7 +358,6 @@ def main():
     processing_thread.join()
     playback_thread.join()
     print("Playback stopped.")
-
 
 if __name__ == "__main__":
     main()
