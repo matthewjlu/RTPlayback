@@ -99,6 +99,7 @@ def load_and_process_audio():
 def audio_playback_worker():
     """
     Continuously fetches audio chunks from the queue and writes them to the audio stream.
+    Applies a short Hann-window fade-in and fade-out to each chunk to smooth discontinuities and reduce popping.
     If playback is paused, the thread sleeps without writing audio.
     """
     global paused
@@ -110,6 +111,8 @@ def audio_playback_worker():
         output=True,
         frames_per_buffer=PLAYBACK_CHUNK
     )
+
+    fade_len = 256  # number of samples for fade-in/out
 
     while not stop_event.is_set():
         if paused:
@@ -126,7 +129,21 @@ def audio_playback_worker():
             continue
         if chunk is None:
             break
-        data = chunk.astype(np.float32).tobytes()
+
+        # Ensure chunk is a numpy array of float32:
+        chunk = np.array(chunk, dtype=np.float32)
+        current_len = len(chunk)
+        actual_fade = min(fade_len, current_len)
+        if actual_fade > 0:
+            # Create a Hann window for 2*actual_fade samples
+            hann_win = np.hanning(actual_fade * 2)
+            fade_in = hann_win[:actual_fade]
+            fade_out = hann_win[actual_fade:]
+            # Apply the fade-in to the beginning and fade-out to the end of the chunk
+            chunk[:actual_fade] *= fade_in
+            chunk[-actual_fade:] *= fade_out
+
+        data = chunk.tobytes()
         try:
             stream.write(data)
         except Exception as e:
@@ -181,11 +198,11 @@ class SpeedControlWindow(QtWidgets.QWidget):
         self.scroll_end_timer.timeout.connect(self.finalize_scroll_session)
 
         self.auto_timer = QtCore.QTimer(self)
-        self.auto_timer.setInterval(3000)  # every 3 seconds
+        self.auto_timer.setInterval(2000)  # every 2 seconds
         self.auto_timer.timeout.connect(self.auto_update_speed)
         self.auto_timer.start()
 
-        # For gradual updates to avoid pops:
+        # For gradual updates to avoid abrupt changes:
         self.gradual_timer = QtCore.QTimer(self)
         self.gradual_timer.setInterval(20)  # 20 ms per step
         self.gradual_timer.timeout.connect(self.update_speed_step)
@@ -243,12 +260,10 @@ class SpeedControlWindow(QtWidgets.QWidget):
 
         self.target_speed += delta * 0.1
         self.target_speed = max(MIN_SPEED, min(self.target_speed, MAX_SPEED))
-        # Immediate update with exponential smoothing:
         self.smoothed_speed = (SMOOTHING_ALPHA * self.target_speed +
                                (1 - SMOOTHING_ALPHA) * self.smoothed_speed)
         current_speed = self.smoothed_speed
 
-        # If new input brings speed above zero, resume if paused.
         if self.smoothed_speed > 0:
             paused = False
             self.pause_button.setText("Pause")
@@ -300,13 +315,12 @@ class SpeedControlWindow(QtWidgets.QWidget):
             self.scroll_events.clear()
             new_speed = avg_speed
         else:
-            recovery_rate = 0.3
+            recovery_rate = 0.15
             new_speed = self.smoothed_speed * (1 - recovery_rate)
 
         if new_speed < 0.07:
             new_speed = 0
             self.label.setText("Playback Paused")
-            print("Auto-updated speed below threshold; pausing playback.")
             while True:
                 try:
                     audio_queue.get_nowait()
@@ -314,15 +328,11 @@ class SpeedControlWindow(QtWidgets.QWidget):
                     break
             paused = True
         else:
-            self.label.setText(f"Playback Speed: {new_speed:.2f}x (Auto-updated)")
-            print(f"Auto-updated speed to {new_speed:.2f}x")
             paused = False
 
-        # Instead of updating abruptly, start a gradual update if there is a significant change.
         if abs(new_speed - self.smoothed_speed) > 0.05:
             self.start_gradual_update(new_speed, steps=10)
         else:
-            # If change is minimal, update directly.
             self.target_speed = new_speed
             self.smoothed_speed = new_speed
             current_speed = new_speed
